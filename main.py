@@ -87,43 +87,90 @@ def calculate_similarity(landmarks1, landmarks2):
 # Generate marks based on similarity
 def generate_marks(similarities):
     max_score = max(similarities)
+    if max_score == 0:
+        max_score = 1
     marks = [100 - (score / max_score * 100) for score in similarities]
     return marks
 
-# Get best and worst moments
-def get_best_and_worst_moments(similarities, top_n=3):
-    sorted_indices = np.argsort(similarities)
-    best_indices = sorted_indices[:top_n]
-    worst_indices = sorted_indices[-top_n:]
+
+def get_best_and_worst_moments(similarities, top_n, fps, clip_duration):
+    clip_frames = clip_duration * fps  # Total number of frames in a clip
+    num_frames = len(similarities)
+
+    # Compute sliding window averages for similarities
+    window_averages = []
+    for i in range(num_frames - clip_frames + 1):
+        window_avg = np.mean(similarities[i:i + clip_frames])
+        window_averages.append(window_avg)
+
+    # Sort indices based on the window averages
+    sorted_indices = np.argsort(window_averages)
+
+    # Select the best indices (smallest averages) and worst indices (largest averages)
+    best_indices = []
+    worst_indices = []
+
+    best_indices.append(sorted_indices[0])  # Add the smallest similarity index
+    worst_indices.append(sorted_indices[-1])  # Add the largest similarity index
+
+    for n in range(1, top_n):
+        # Find the next valid best index
+        for i in sorted_indices:
+            if all(abs(i - prev_idx) >= clip_frames for prev_idx in best_indices):  # Check non-overlap
+                best_indices.append(i)
+                break
+
+        # Find the next valid worst index
+        for j in sorted_indices[::-1]:
+            if all(abs(j - prev_idx) >= clip_frames for prev_idx in worst_indices):  # Check non-overlap
+                worst_indices.append(j)
+                break
+
+    print(f"Best Indices: {best_indices}, Worst Indices: {worst_indices}")
     return best_indices, worst_indices
 
-# Extract 3-second clips for best and worst moments
-def extract_clips(video_path, indices, output_dir, clip_duration=3, fps=30):
+
+def extract_clips(video_path, indices, output_dir, clip_duration, fps):
     os.makedirs(output_dir, exist_ok=True)
     cap = cv2.VideoCapture(video_path)
 
-    for i, frame_idx in enumerate(indices):
-        start_frame = max(0, frame_idx - (clip_duration // 2) * fps)
-        end_frame = start_frame + clip_duration * fps
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    clip_frames = clip_duration * fps  # Total number of frames in a clip
+
+    extracted_clips = 0
+    for i, idx in enumerate(indices):
+        print(f"Processing clip {i + 1} at frame {idx}")
+        if extracted_clips >= 3:  # Limit to 3 clips
+            break
+
+        start_frame = max(0, idx)
+        end_frame = start_frame + clip_frames
+
+        # Ensure the clip duration fits within the video length
+        if end_frame > frame_count:
+            end_frame = frame_count
 
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         out = cv2.VideoWriter(
-            f'{output_dir}/clip_{i+1}.mp4',
+            f'{output_dir}/clip_{extracted_clips + 1}.mp4',
             cv2.VideoWriter_fourcc(*'mp4v'), fps,
             (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
              int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
         )
 
-        for _ in range(end_frame - start_frame):
+        for frame_idx in range(start_frame, end_frame):
             ret, frame = cap.read()
             if not ret:
                 break
             out.write(frame)
+
         out.release()
+        extracted_clips += 1
 
     cap.release()
-
+    print(f"Extracted {extracted_clips} clips to {output_dir}")
 def generate_overlay_video(test_video_path, reference_video_path, reference_landmarks_csv, test_landmarks_csv, output_video_path):
+    global scale_factor
     import cv2
     import pandas as pd
     import mediapipe as mp
@@ -148,6 +195,19 @@ def generate_overlay_video(test_video_path, reference_video_path, reference_land
         (frame_width, frame_height)
     )
 
+    for i in range(50):
+        if i >= len(landmarks_df) or i >= len(landmarks_test):
+            break
+
+        time_row = landmarks_df.iloc[i]
+        time_row_test = landmarks_test.iloc[i]
+
+        # Get width values for test and reference
+        width_test_temp = abs(time_row_test['right_shoulder_x'] - time_row_test['left_shoulder_x'])
+        width_ref_temp = abs(time_row['right_shoulder_x'] - time_row['left_shoulder_x'])
+        scale_factor = width_test_temp/width_ref_temp
+    # Constrain the scaling factor dynamically
+    scale_factor = max(0.8, min(scale_factor, 1.2))
     mp_pose = mp.solutions.pose
     pose_connections = mp_pose.POSE_CONNECTIONS
 
@@ -188,21 +248,13 @@ def generate_overlay_video(test_video_path, reference_video_path, reference_land
             test_row['left_hip_y']
         ) / 4
 
-        # Calculate shoulder widths dynamically
-        ref_shoulder_width = abs(ref_row['right_shoulder_x'] - ref_row['left_shoulder_x'])
-        test_shoulder_width = abs(test_row['right_shoulder_x'] - test_row['left_shoulder_x'])
 
-        # Calculate scaling factor for this frame
-        scale_factor = test_shoulder_width / (ref_shoulder_width + 1e-6)
-
-        # Constrain the scaling factor dynamically
-        scale_factor = max(0.8, min(scale_factor, 1.2))
 
         # Calculate offsets to align dynamically
         x_offset = (test_upper_body_x * frame_width) - (ref_upper_body_x * frame_width_ref * scale_factor)
         y_offset = (test_upper_body_y * frame_height) - (ref_upper_body_y * frame_height_ref * scale_factor)
 
-        print(f"Frame {frame_count}: Scale Factor = {scale_factor}, X Offset = {x_offset}, Y Offset = {y_offset}")
+        #print(f"Frame {frame_count}: Scale Factor = {scale_factor}, X Offset = {x_offset}, Y Offset = {y_offset}")
 
         # Reshape reference landmarks
         ref_landmarks = ref_row[1:].values.reshape(-1, 4)  # x, y, z, visibility
@@ -258,14 +310,16 @@ if __name__ == "__main__":
     marks = generate_marks(similarities)
     print(f"Overall Score: {np.mean(marks):.2f}")
 
+    # Generate overlay video
+    generate_overlay_video('test.mp4', 'reference.mp4', 'landmarks_with_timestamps_1.csv',
+                           'landmarks_with_timestamps_2.csv', 'overlay_video.mp4')
     # Get best and worst moments
-    best_indices, worst_indices = get_best_and_worst_moments(similarities)
+    best_indices, worst_indices = get_best_and_worst_moments(similarities,3,fps1,3)
 
     # Extract clips
-    extract_clips('test.mp4', best_indices, 'best_clips', clip_duration=3, fps=fps2)
-    extract_clips('test.mp4', worst_indices, 'worst_clips', clip_duration=3, fps=fps2)
+    extract_clips('overlay_video.mp4', best_indices, 'best_clips', 3, fps2)
+    extract_clips('overlay_video.mp4', worst_indices, 'worst_clips',3, fps2)
 
-    # Generate overlay video
-    generate_overlay_video('test.mp4', 'reference.mp4','landmarks_with_timestamps_1.csv','landmarks_with_timestamps_2.csv', 'overlay_video.mp4')
+
 
     print("Best and worst moment clips saved successfully.")
