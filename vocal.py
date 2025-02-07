@@ -7,13 +7,15 @@ class VocalSync:
         self.ref = reference_path
         self.test = test_path
 
-    def extract_audio_array(self,duration, video_path, sr=8000):
+    def extract_audio_array(self, duration, video_path, sr=8000):
         """
-        Extract audio from the video as a float32 NumPy array (mono), resampled to 'sr'.
+        Extract audio from 'video_path' as float32 NumPy array (mono), resampled to 'sr'.
         Returns (audio_array, sr).
+
+        Performance Tip: Lower 'sr' or shorter 'duration' can speed up the offset detection step.
         """
         clip = VideoFileClip(video_path).subclipped(0, 0 + duration)
-        audio_array = clip.audio.to_soundarray(fps=sr)  # <--- replaces 'clip.audio.set_fps(sr)'
+        audio_array = clip.audio.to_soundarray(fps=sr)
         clip.close()
 
         if audio_array.ndim == 2 and audio_array.shape[1] == 2:
@@ -23,8 +25,14 @@ class VocalSync:
         return audio_array.astype(np.float32), sr
 
     def find_audio_offset(self, y_ref, y_test, sr):
+        """
+        Find offset (in seconds) via cross-correlation.
+        Positive offset => test is behind reference.
+        Negative offset => test is ahead of reference.
+        """
         if len(y_ref) == 0 or len(y_test) == 0:
             return 0.0
+
         corr = np.correlate(y_ref, y_test, mode='full')
         best_idx = np.argmax(corr)
         shift_in_samples = best_idx - (len(y_test) - 1)
@@ -32,13 +40,20 @@ class VocalSync:
         return offset_seconds
 
     def shift_or_trim_clip(self, clip, clip_test, offset_seconds):
+        """
+        Shift/trim a clip to align with the other clip, based on offset_seconds.
+        offset_seconds > 0 => reference leads
+        offset_seconds < 0 => test leads
+        """
         if offset_seconds > 0:
+            # We need to trim 'reference' clip or start it later
             start_trim = offset_seconds
             if start_trim >= clip.duration:
+                # If offset is bigger than clip duration, produce a 1s black clip
                 from moviepy.video.fx import Freeze
                 w, h = clip.size
                 black_clip = (clip.fx(Freeze, t=0)
-                              .subclipped(0, 0.01)
+                              .subclip(0, 0.01)
                               .resize((w, h))
                               .set_duration(1.0)
                               .volumex(0))
@@ -55,11 +70,17 @@ class VocalSync:
                              synced_ref_output="ref_synced.mp4",
                              synced_test_output="test_synced.mp4",
                              sr=44100):
-
+        """
+        1) Extract audio from both videos (default 10 seconds in the calling function).
+        2) Compute offset.
+        3) Shift/trim the leading video to align starts.
+        4) Trim both to same final duration.
+        5) Save the final synced videos.
+        """
         print("Extracting audio from reference...")
-        y_ref, sr_ref = self.extract_audio_array(10,ref_path, sr=sr)
+        y_ref, sr_ref = self.extract_audio_array(10, ref_path, sr=sr)
         print("Extracting audio from test...")
-        y_test, sr_test = self.extract_audio_array(10,test_path, sr=sr)
+        y_test, sr_test = self.extract_audio_array(10, test_path, sr=sr)
 
         print("Finding audio offset via cross-correlation...")
         offset_seconds = self.find_audio_offset(y_ref, y_test, sr)
@@ -70,15 +91,16 @@ class VocalSync:
 
         print("Shifting/Trimming test clip based on offset...")
         if offset_seconds < 0:
+            # Negative => test leads
             ref_shifted = ref_clip
             test_shifted = self.shift_or_trim_clip(ref_clip, test_clip, offset_seconds)
             final_duration = min(ref_shifted.duration, test_shifted.duration)
         else:
+            # Positive => reference leads
             ref_shifted = self.shift_or_trim_clip(ref_clip, test_clip, offset_seconds)
             final_duration = min(test_clip.duration, ref_shifted.duration)
 
         print("Trimming both to the same final duration...")
-
         if final_duration == test_clip.duration and test_clip.duration == ref_shifted.duration:
             ref_final = ref_shifted
             test_final = test_clip
@@ -97,11 +119,14 @@ class VocalSync:
         test_clip.close()
         ref_final.close()
         test_final.close()
+
         print("Done syncing videos.")
         return synced_ref_output, synced_test_output
 
     def start_vocalSync(self):
-
+        """
+        Main wrapper => produce 'reference_synced.mp4' & 'test_synced.mp4'.
+        """
         synced_ref, synced_test = self.sync_videos_by_audio(
             ref_path=self.ref,
             test_path=self.test,
@@ -110,4 +135,4 @@ class VocalSync:
             sr=44100
         )
         print("Synced files:", synced_ref, synced_test)
-        return synced_ref,synced_test
+        return synced_ref, synced_test
